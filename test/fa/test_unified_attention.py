@@ -353,6 +353,30 @@ def test_unified_attention_matches_independent_paged_reference(causal: bool) -> 
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an HCU/CUDA Triton device")
+def test_gfx946_fully_masked_prefill_rows_return_zero() -> None:
+    generator = torch.Generator().manual_seed(17)
+    q_cpu = torch.randn(5, 4, 32, generator=generator).bfloat16()
+    k_cpu = torch.randn(1, 16, 2, 32, generator=generator).bfloat16()
+    v_cpu = torch.randn(1, 16, 2, 32, generator=generator).bfloat16()
+    reference = _reference_single_masked(
+        q_cpu, k_cpu, v_cpu, 3, 32**-.5,
+        lambda query_pos, keys: keys <= query_pos,
+    ).nan_to_num(0.0)
+    q, k, v = q_cpu.cuda(), k_cpu.cuda(), v_cpu.cuda()
+    out = torch.empty_like(q)
+    unified_attention(
+        q, k, v, out, torch.tensor([0, 5], device='cuda', dtype=torch.int32),
+        5, torch.tensor([3], device='cuda', dtype=torch.int32), 3, 32**-.5,
+        True, (-1, -1), torch.zeros(1, 1, dtype=torch.int32).cuda(),
+        0.0, None, None, None,
+    )
+    actual = out.cpu()
+    assert torch.isfinite(actual).all()
+    assert torch.count_nonzero(actual[:2]) == 0
+    torch.testing.assert_close(actual, reference, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires an HCU/CUDA Triton device")
 def test_per_sequence_causal_tensor_matches_reference() -> None:
     q_lens, kv_lens, q, k, v, out, indptr, lens, table = _paged_inputs("cuda")
     causal = torch.tensor([True, False], device="cuda", dtype=torch.bool)
@@ -1395,6 +1419,107 @@ def test_gfx946_workload_fallback_dispatch(case: _UaWorkloadShape, monkeypatch) 
     assert result == expected
 
 
+@pytest.mark.parametrize('feature', ['plain', 'other_arch', 'prefill', 'softcap', 'window', 'bf16_cache', 'missing_scale'])
+def test_gfx946_gluon_wasp_route_guards(feature, monkeypatch):
+    backend = importlib.import_module('boltops.fa.unified_attention.triton.unified_attention')
+    wasp = importlib.import_module('boltops.fa.unified_attention.triton.unified_attention_wasp_gluon')
+    calls = []
+    monkeypatch.setattr(backend, '_gluon_wasp_device_supported', lambda device: feature != 'other_arch')
+    monkeypatch.setattr(wasp, 'launch_unified_attention_wasp_gluon', lambda *args: calls.append(args))
+    q = torch.empty(2, 32, 128, dtype=torch.bfloat16)
+    cache_dtype = torch.bfloat16 if feature == 'bf16_cache' else torch.float8_e4m3fn
+    kwargs = dict(
+        q=q, k=torch.empty(2, 16, 8, 128, dtype=cache_dtype),
+        v=torch.empty(2, 16, 8, 128, dtype=cache_dtype), out=torch.empty_like(q),
+        cu_seqlens_q=torch.arange(3, dtype=torch.int32),
+        max_seqlen_q=2 if feature == 'prefill' else 1,
+        seqused_k=torch.full((2,), 16, dtype=torch.int32), softmax_scale=128**-.5,
+        window_size=(8, -1) if feature == 'window' else (-1, -1),
+        block_table=torch.arange(2, dtype=torch.int32)[:, None],
+        softcap=1.0 if feature == 'softcap' else 0.0,
+        k_descale=None if feature == 'missing_scale' else torch.ones(1), v_descale=torch.ones(1),
+        alibi_slopes=None, output_scale=None, qq_bias=None, sinks=None, mm_prefix_range=None,
+    )
+    assert backend._try_unified_attention_wasp_gluon(**kwargs) is (feature == 'plain')
+    assert len(calls) == (1 if feature == 'plain' else 0)
+
+
+def test_gfx946_gluon_wasp_device_guard_rejects_cpu(monkeypatch):
+    backend = importlib.import_module('boltops.fa.unified_attention.triton.unified_attention')
+    monkeypatch.setattr(backend, 'get_arch', lambda device: 'gfx946')
+    assert not backend._gluon_wasp_device_supported(torch.device('cpu'))
+    assert backend._gluon_wasp_device_supported(torch.device('cuda', 0))
+
+
+def test_gfx946_gluon_wasp_measured_launch_options(monkeypatch):
+    backend = importlib.import_module('boltops.fa.unified_attention.triton.unified_attention_wasp_gluon')
+    calls = []
+
+    class CaptureKernel:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                calls.append((grid, kwargs))
+            return launch
+
+    monkeypatch.setattr(backend, 'unified_attention_wasp_gluon', CaptureKernel())
+    q = torch.empty(2, 32, 128, dtype=torch.bfloat16)
+    cache = torch.empty(2, 16, 8, 128, dtype=torch.float8_e4m3fn)
+    backend.launch_unified_attention_wasp_gluon(
+        q, cache, cache, torch.empty_like(q), torch.arange(3, dtype=torch.int32),
+        torch.full((2,), 16, dtype=torch.int32), torch.zeros(2, 1, dtype=torch.int32),
+        torch.ones(1), torch.ones(1), 128**-.5,
+    )
+    grid, options = calls.pop()
+    assert grid == (2, 8)
+    assert options['TILE_SIZE'] == 64
+    assert options['PARTITION_WARPS'] == options['wasp_partition_warps'] == (4, 4)
+    assert options['PARTITION_REGS'] == options['wasp_partition_regs'] == (40, 116)
+    assert options['wasp_wdra'] is True
+
+
+@pytest.mark.parametrize('feature,expected', [
+    ('plain', 'wasp'), ('batch511', 'ordinary'), ('key377', 'ordinary'),
+    ('softcap', 'ordinary'), ('other_device', 'ordinary'),
+    ('partial_scratch', 'ordinary'),
+])
+def test_gfx946_wasp_default_dispatch(feature, expected, monkeypatch):
+    backend = importlib.import_module('boltops.fa.unified_attention.triton.unified_attention')
+    wasp = importlib.import_module('boltops.fa.unified_attention.triton.unified_attention_wasp_gluon')
+    calls = []
+
+    class CaptureKernel:
+        def __init__(self, route):
+            self.route = route
+
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                calls.append((self.route, kwargs))
+            return launch
+
+    monkeypatch.setattr(backend, 'kernel_unified_attention_2d', CaptureKernel('ordinary'))
+    monkeypatch.setattr(wasp, 'unified_attention_wasp_gluon', CaptureKernel('wasp'))
+    monkeypatch.setattr(backend, '_gluon_wasp_device_supported', lambda device: feature != 'other_device')
+    monkeypatch.setattr(backend, 'get_arch', lambda device: 'gfx946')
+    monkeypatch.setattr(backend, '_get_unified_attention_2d_config', lambda **kwargs: dict(BLOCK_M=16, TILE_SIZE=32, num_warps=4, num_stages=2))
+    batch = 511 if feature == 'batch511' else 512
+    length = 377 if feature == 'key377' else 376
+    q = torch.empty(batch, 32, 128, dtype=torch.bfloat16)
+    cache = torch.empty(2, 16, 8, 128, dtype=torch.float8_e4m3fn)
+    backend._unified_attention_core(
+        q, cache, cache, torch.empty_like(q), torch.arange(batch + 1, dtype=torch.int32), 1,
+        torch.full((batch,), length, dtype=torch.int32), length, 128**-.5, True, (-1, -1),
+        torch.zeros(batch, 24, dtype=torch.int32), 1.0 if feature == 'softcap' else 0.0,
+        None, torch.ones(1), torch.ones(1),
+        softmax_segm_output=torch.empty(1) if feature == 'partial_scratch' else None,
+    )
+    route, options = calls.pop()
+    assert route == expected
+    if expected == 'wasp':
+        assert options['TILE_SIZE'] == 64
+        assert options['PARTITION_REGS'] == (40, 116)
+        assert options['PARTITION_WARPS'] == (4, 4)
+
+
 _SMALL_UA_SHAPE_SCORES = 2 * 10**8
 _HUGE_UA_SHAPE_BYTES = 96 * 1024**3
 _UA_LARGE_ENABLED = os.environ.get("BOLTOPS_UA_RUN_LARGE", "") not in ("", "0")
@@ -1672,7 +1797,7 @@ def _bench_1102_case_id(case):
     return f"{case['source_op']}-{case['route']}-{case['shape_id']}"
 
 
-def _build_bench_1102_runner(case, device='cuda'):
+def _build_bench_1102_runner(case, device='cuda', initialize=True):
     """Allocate inputs once; return an operator/component invocation for timing."""
     shape = case['shape']
     inputs = shape['inputs']
@@ -1681,7 +1806,7 @@ def _build_bench_1102_runner(case, device='cuda'):
 
     def tensor(*dims, dtype=torch.bfloat16, value=None):
         tensor = torch.empty(dims, dtype=dtype, device=device)
-        if tensor.device.type != 'meta':
+        if tensor.device.type != 'meta' and initialize:
             if value is not None:
                 tensor.fill_(value)
             elif dtype == torch.float8_e4m3fn:
